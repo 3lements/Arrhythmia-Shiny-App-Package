@@ -141,6 +141,8 @@ analysis <- p.stats_essemble %>%
 ```
 
 ```{r}
+## Removes Noise Wells from Pks and Analysis
+#Would have Arrhythmia removed here but there is no arrhythmia detection in this version of the script
 noise_wells <- analysis %>%
   filter(Noise == TRUE) %>%
   pull(Well)
