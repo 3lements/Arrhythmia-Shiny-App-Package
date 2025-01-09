@@ -1,0 +1,356 @@
+---
+title: "ArrhythmiaShiny-Manual Script"
+author: "Ben Johnson"
+date: "2024-08-19"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(ggsci)
+require(cowplot)
+require(plyr)
+require(data.table)
+require(tidyverse)
+require(ggplot2)
+require(gridExtra)
+require(pspline)
+
+source("Find_peaks_V2.0.R")
+
+ImportCSV <- file.choose()
+```
+
+```{r}
+Smoothing <- 0.003
+peak_val <- 8
+trough_val <- 6
+pref_val <- 0.6
+noise_val <- 1000
+
+
+ExportStatement1 <- F
+TrimCSV <- F
+
+FileMasterName <- "Marc_Day21_CMP_"
+ExportSmooth <- paste0(FileMasterName,"SmoothedCSV.csv")
+ExportSegments <- paste0(FileMasterName,"Segments.csv")
+ExportAnalysis <- paste0(FileMasterName,"Analysis.csv")
+```
+
+
+```{r}
+df <- fread(ImportCSV, sep = ",", header = TRUE, check.names = FALSE)
+
+if (TrimCSV == TRUE) {
+df <- df %>% select(1:8896)
+}
+
+df <- df %>% pivot_longer(2:length(df), names_to = "Time", values_to = ("OD"))
+df$OD <- as.numeric(df$OD)
+df$Time <- as.numeric(df$Time)
+df$Smooth <- NA
+
+for (well_name in unique(df$Well)) {
+  
+    subset_data <- df[df$Well == well_name, ]
+    subset_data <- subset_data %>%
+    mutate(Smooth = suppressWarnings(predict(loess(OD ~ Time, span = Smoothing))))
+    df[df$Well == well_name, ]$Smooth <- subset_data$Smooth
+}
+
+if (ExportStatement1 == TRUE) {
+df_wide <- df
+df_wide$OD <- NULL
+df_wide <- df_wide %>%
+  pivot_wider(names_from = "Time", values_from = "Smooth", names_sep = "_")
+write.csv(df_wide, file = ExportSmooth, row.names = FALSE)
+}
+
+pks <- find_peaks(df, "Smooth", top = peak_val, bot = trough_val, pref = pref_val)
+pks <- pks %>% group_by(Well, shape) %>% slice(-c(1,n()))
+      
+ 
+t0 <- min(df$Time, na.rm = TRUE)
+tn <- max(df$Time, na.rm = TRUE)
+ymax <- max(df$Smooth, na.rm = TRUE)*1.05
+tTot <- (tn - t0) 
+
+Peaks <- pks %>% filter(shape == "max") %>% group_by(Well) %>% arrange(Well, Time) %>% ## generate poincaré plot stats
+        mutate(RR = (Time - lag(Time, default = NA))/1000, 
+               RRn = (lead(Time, default = NA) - Time)/1000, 
+               dRR = RR - RRn,
+               Freq = (n() / (tTot/1000)) * 60)
+
+Peaks <- Peaks %>% ungroup() %>% 
+        mutate(Rhythm = ifelse(RR > RRn*1.1, 0,
+                               ifelse(RR < RRn*0.9, 0, 1)), 
+               RRnmin = RRn*0.9, 
+               Rnmax = 1.1*RRn)
+      
+p.stats <- Peaks %>%  #generate ellipse statistics~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+      group_by(Well) %>% summarise(meanRR = mean(RR, na.rm = TRUE), 
+                             medianRR = median(RR, na.rm = TRUE), 
+                             meandRR = mean(dRR, na.rm = TRUE),
+                             SD_length = sd(RRn, na.rm = TRUE), 
+                             SD_width = sd(dRR, na.rm = TRUE)/sqrt(2),
+                             Freq = mean(Freq, na.rm = TRUE),
+                             BVR = sum(abs(dRR), na.rm = TRUE)/length(dRR)*sqrt(2))
+p.stats$SD_length <- as.numeric(p.stats$SD_length)
+p.stats$SD_width <- as.numeric(p.stats$SD_width)
+p.stats$meanRR <- as.numeric(p.stats$meanRR)
+      
+p.stats_ratio_ellipse <- p.stats %>%
+    na.omit() %>%
+    mutate(
+      ratio = mean(c(SD_length, SD_width), na.rm = TRUE) / meanRR,
+      ellipse = SD_length / SD_width
+    )
+  
+pks_abnormality <- pks %>%
+    group_by(Well) %>%
+    filter(shape == "min") %>%
+    summarise(
+      minTroughAmp = min(Smooth),
+      maxTroughAmp = max(Smooth),
+      diffTroughAmp = maxTroughAmp - minTroughAmp,
+      sdTroughAmp = sd(Smooth)
+    )
+  
+pks_fib <- pks %>%
+    group_by(Well) %>%
+    arrange(desc(Smooth)) %>%
+    summarise(
+      lowSmooth = mean(tail(Smooth, 3), na.rm = T),
+      hiSmooth = mean(head(Smooth, 3), na.rm = T),
+      Amplitude = hiSmooth - lowSmooth,
+      Threshold = lowSmooth + Amplitude*0.2,
+      PeakCleanUp = lowSmooth + Amplitude*0.15
+    )
+  
+  
+p.stats_essemble <- p.stats_ratio_ellipse %>%
+    left_join(pks_abnormality, by = "Well") %>%
+      left_join(pks_fib, by = "Well")
+
+
+analysis <- p.stats_essemble %>%
+  mutate(Noise = ifelse(Amplitude < 1000, TRUE, FALSE))
+
+```
+
+```{r}
+noise_wells <- analysis %>%
+  filter(Noise == TRUE) %>%
+  pull(Well)
+
+pks <- pks %>%
+  filter(!Well %in% noise_wells)
+
+analysis <- analysis %>%
+  filter(!Well %in% noise_wells)
+
+min_points <- pks %>%
+  filter(shape == "min")
+
+min_merge <- left_join(min_points, analysis, by = "Well")
+min_merge <- min_merge %>%
+  filter(Smooth <= Threshold)
+
+max_points <- pks %>%
+  filter(shape == "max")
+
+min_intervals <- min_merge %>%
+  mutate(next_time = lead(Time)) %>%
+  filter(!is.na(next_time))
+
+segment_counters <- setNames(rep(0, length(unique(min_intervals$Well))), unique(min_intervals$Well))
+
+extract_segment <- function(row, df) {
+  well <- row$Well
+  start_time <- row$Time
+  end_time <- row$next_time
+  
+  # Increment the counter for the current well
+  segment_counters[[well]] <<- segment_counters[[well]] + 1
+  segment_id <- paste0(well, "_", segment_counters[[well]]) # Create unique segment ID
+  
+  segment_data <- df %>%
+    filter(Well == well & Time >= start_time & Time <= end_time) %>%
+    select(Well, Time, Smooth) %>%
+    mutate(Segment = segment_id)
+  
+  return(segment_data)
+}
+
+segments <- by(min_intervals, 1:nrow(min_intervals), function(row) extract_segment(row, df))
+segments_combined <- do.call(rbind, segments)
+
+seg_merge <- left_join(segments_combined, analysis, by = "Well") %>% filter(Smooth >= PeakCleanUp)
+seg_merge <- seg_merge[,1:4]
+seg_merge <- seg_merge %>%
+   group_by(Segment) %>%
+  mutate(
+    min_smooth = min(Smooth, na.rm = TRUE),
+    max_smooth = max(Smooth, na.rm = TRUE),
+    Normalized_Smooth = (Smooth - min_smooth) / (max_smooth - min_smooth)
+  ) %>%
+  ungroup() %>%
+  select(-min_smooth, -max_smooth)
+
+
+segments_with_max <- seg_merge %>%
+  group_by(Segment) %>%
+  mutate(Max_Smooth = max(Smooth),
+         Max_Time = Time[which.max(Smooth)])
+
+segments_labeled <- segments_with_max %>%
+  mutate(Phase = case_when(
+    Time < Max_Time ~ "rising",
+    Time > Max_Time ~ "relaxation",
+    Time == Max_Time ~ "peak"
+  ))
+
+segments_trimmed <- segments_labeled %>%
+  group_by(Segment) %>%
+  mutate(
+    Baseline = mean(tail(Smooth, 10), na.rm = TRUE),
+    Amplitude = max(Smooth) - Baseline,
+    Peak_Time = first(Max_Time),
+    Start_Time = min(Time),
+    CutOff = Amplitude * 0.05 + Baseline,
+    End_Time = {
+      relaxation_times = Time[Time > Peak_Time & Smooth <= CutOff]
+      if(length(relaxation_times) > 0) min(relaxation_times) else max(Time)
+    }
+  ) %>%
+  ungroup() %>%
+  group_by(Segment) %>%
+  filter(Time <= End_Time)
+
+
+segment_times <- segments_trimmed %>%
+  group_by(Segment) %>%
+  summarise(
+    Well = first(Well),
+    Peak_Time = first(Max_Time), 
+    Start_Time = min(Time),
+    Baseline = mean(tail(Smooth, 10), na.rm = TRUE),
+    Amplitude = max(Smooth) - Baseline,
+    CutOff = Amplitude * 0.05 + Baseline,
+    CutOff20 = Amplitude * 0.2 + Baseline,
+    CutOff50 = Amplitude * 0.5 + Baseline,
+    CutOff80 = Amplitude * 0.8 + Baseline,
+    
+    Rising_TimeAt20 = {
+      rising_times = max(Time[Time < Peak_Time & Smooth <= CutOff20])
+    },
+    
+    Rising_TimeAt50 = {
+      rising_times = max(Time[Time < Peak_Time & Smooth <= CutOff50])
+    },
+    
+    Rising_TimeAt80 = {
+      rising_times = max(Time[Time < Peak_Time & Smooth <= CutOff80])
+    },
+    
+    End_Time = {
+      relaxation_times = Time[Time > Peak_Time & Smooth <= CutOff]
+      if(length(relaxation_times) > 0) min(relaxation_times) else max(Time)
+    },
+    
+    End_TimeAt20 = {
+      relaxation_times = Time[Time > Peak_Time & Smooth <= CutOff20]
+      if(length(relaxation_times) > 0) min(relaxation_times) else max(Time)
+    },
+    
+    End_TimeAt50 = {
+      relaxation_times = Time[Time > Peak_Time & Smooth <= CutOff50]
+      if(length(relaxation_times) > 0) min(relaxation_times) else max(Time)
+    },
+    
+    End_TimeAt80 = {
+      relaxation_times = Time[Time > Peak_Time & Smooth <= CutOff80]
+      if(length(relaxation_times) > 0) min(relaxation_times) else max(Time)
+    },
+    
+    Trace_Time = (End_Time - Start_Time)/1000,
+    Rising_Time = (Peak_Time - Start_Time)/1000,
+    Rising_TimeTo20 = (Rising_TimeAt20 - Start_Time)/1000,
+    Rising_TimeTo50 = (Rising_TimeAt50 - Start_Time)/1000,
+    Rising_TimeTo80 = (Rising_TimeAt80 - Start_Time)/1000,
+    
+    Relaxation_Time = (End_Time - Peak_Time)/1000,
+    Relaxtion_TimeTo20 = (End_TimeAt20 - Peak_Time)/1000,
+    Relaxtion_TimeTo50 = (End_TimeAt50 - Peak_Time)/1000,
+    Relaxtion_TimeTo80 = (End_TimeAt80 - Peak_Time)/1000,
+    Relaxation_Time50toEnd = (Trace_Time - Rising_Time - Relaxtion_TimeTo50),
+    
+     Min_Rising_Smooth = {
+      rising_smooth_values = Smooth[Phase == "rising"]
+      min(rising_smooth_values, na.rm = TRUE)
+    },
+    
+    Max_Rising_Smooth = {
+      rising_smooth_values = Smooth[Phase == "rising"]
+      max(rising_smooth_values, na.rm = TRUE)
+    },
+    
+    Forward_Velocity = (Max_Rising_Smooth - Min_Rising_Smooth) / (Peak_Time - Start_Time),
+    
+    Relaxation_VelecityTo50 = {
+      start_value = max(Normalized_Smooth)
+      end_value = Normalized_Smooth[Time == End_TimeAt50]
+      ((end_value - start_value) / (Peak_Time - End_TimeAt50))*1000
+    },
+    
+    Relaxation_Velecity50ToEnd = {
+      start_value = Normalized_Smooth[Time == End_TimeAt50]
+      end_value = Normalized_Smooth[Time == End_Time]
+      ((end_value - start_value) / (End_TimeAt50 - End_Time))*1000
+    },
+    
+)
+  
+summary_segment <- segment_times %>%
+  group_by(Well) %>%
+  summarise(
+    Well = first(Well),
+    Avg_Baseline = mean(Baseline, na.rm = T),
+    SD_Baseline = sd(Baseline, na.rm = T),
+    Avg_Amplitude = mean(Amplitude, na.rm = T),
+    SD_Amplitude = sd(Amplitude, na.rm = T),
+    Avg_Rising_Time = mean(Rising_Time, na.rm = TRUE),
+    SD_Rising_Time = sd(Rising_Time, na.rm = TRUE),
+    
+    Avg_Rising_Timeto20 = mean(Rising_TimeTo20, na.rm = TRUE),
+    SD_Rising_Timeto20 = sd(Rising_TimeTo20, na.rm = TRUE),
+    Avg_Rising_Timeto50 = mean(Rising_TimeTo50, na.rm = TRUE),
+    SD_Rising_Timeto50 = sd(Rising_TimeTo50, na.rm = TRUE),
+    Avg_Rising_Timeto80 = mean(Rising_TimeTo80, na.rm = TRUE),
+    SD_Rising_Timeto80 = sd(Rising_TimeTo80, na.rm = TRUE),
+    
+    Avg_Relaxation_Time = mean(Relaxation_Time, na.rm = TRUE),
+    SD_Relaxation_Time = sd(Relaxation_Time, na.rm = TRUE),
+    Avg_RelaxTo50 = mean(Relaxtion_TimeTo50, na.rm = T),
+    SD_RelaxTo50 = sd(Relaxtion_TimeTo50, na.rm = T),
+    Avg_Relax50toEnd = mean(Relaxation_Time50toEnd, na.rm = T),
+    SD_Relax50toEnd = sd(Relaxation_Time50toEnd, na.rm = T),
+    
+    Avg_Relaxation_Velocityto50 = mean(Relaxation_VelecityTo50, na.rm = TRUE),
+    SD_Relaxation_Velocityto50 = sd(Relaxation_VelecityTo50, na.rm = TRUE),
+    Avg_Relaxation_VelocitytoEnd = mean(Relaxation_Velecity50ToEnd, na.rm = TRUE),
+    SD_Relaxation_VelocitytoEnd = sd(Relaxation_Velecity50ToEnd, na.rm = TRUE),
+    
+    Avg_Forward_Velocity = mean(Forward_Velocity, na.rm = TRUE),
+    SD_Forward_Velocity = sd(Forward_Velocity, na.rm = TRUE)
+  )
+
+
+write.csv(segments_trimmed, "All_SegmentsD21CMP.CSV")
+write.csv(summary_segment, ExportAnalysis, row.names = F)
+
+```
+
+
